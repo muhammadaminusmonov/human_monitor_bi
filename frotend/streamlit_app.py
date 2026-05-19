@@ -1,6 +1,3 @@
-# streamlit_app.py
-# AI Surveillance + BI Dashboard (ASSBI Frontend - FULL VERSION WITH LIVE CAMERA)
-
 import streamlit as st
 import requests
 import pandas as pd
