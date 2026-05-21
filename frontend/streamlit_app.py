@@ -1,14 +1,10 @@
-
-
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
 from streamlit_autorefresh import st_autorefresh
 
-# ------------------------------------------------
-# CONFIG
-# ------------------------------------------------
+
 
 API_URL = "http://localhost:8000"
 
@@ -19,15 +15,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ------------------------------------------------
-# AUTO REFRESH
-# ------------------------------------------------
+
 
 st_autorefresh(interval=5000, key="refresh")
 
-# ------------------------------------------------
-# CUSTOM CSS
-# ------------------------------------------------
+
 
 st.markdown("""
 <style>
@@ -343,9 +335,9 @@ elif menu == "🏙 Location Management":
     if city_submit:
 
         res = requests.post(
-    f"{API_URL}/cities/",
-    params={"name": city_name}
-)
+            f"{API_URL}/cities/",
+            json={"name": city_name}
+        )
 
         if res.status_code == 200:
             st.success("City added successfully")
@@ -377,12 +369,12 @@ elif menu == "🏙 Location Management":
     if street_submit and city_map:
 
         res = requests.post(
-    f"{API_URL}/streets/",
-    params={
-        "name": street_name,
-        "city_id": city_map[selected_city]
-    }
-)
+            f"{API_URL}/streets/",
+            json={
+                "name": street_name,
+                "city_id": city_map[selected_city]
+            }
+        )
 
         if res.status_code == 200:
             st.success("Street added successfully")
