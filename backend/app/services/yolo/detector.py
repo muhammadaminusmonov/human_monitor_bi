@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Generator, Tuple, List, Dict, Any
 
 # Путь к весам модели
-WEIGHTS_PATH = Path(__file__).parent.parent.parent / "models" / "weight" / "best.pt"
+WEIGHTS_PATH = Path(__file__).parent.parent.parent / "models" / "weight" / "yolo11n.pt"
 
 
 def load_model():

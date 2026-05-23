@@ -1,8 +1,4 @@
-"""
-WebSocket endpoint для стрима камеры с YOLO-детекцией.
 
-Подключение: ws://localhost:8000/ws/stream/{camera_id}
-"""
 
 import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
@@ -19,7 +15,6 @@ from app.services.yolo.detector import stream_frames
 
 router = APIRouter()
 
-# Порог скопления людей для генерации алерта
 CROWD_THRESHOLD = 10
 
 
@@ -59,12 +54,12 @@ async def camera_stream(
     await manager.connect(camera_id, websocket)
 
     try:
-        # Запускаем стрим в executor чтобы не блокировать event loop
+
         loop = asyncio.get_event_loop()
 
         def run_stream():
             for frame_data in stream_frames(video_source, conf_threshold=0.4, max_fps=15):
-                # Сохраняем в БД каждый 30-й кадр чтобы не перегружать БД
+                
                 _save_to_db(db, camera_id, frame_data)
                 asyncio.run_coroutine_threadsafe(
                     manager.broadcast(camera_id, {
