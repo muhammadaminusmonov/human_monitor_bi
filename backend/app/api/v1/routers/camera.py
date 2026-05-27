@@ -70,7 +70,6 @@ def generate_camera_stream(video_source: str):
 @router.post("/")
 def create_camera(
     camera_name: str = Form(...),
-    street_id: int = Form(...),
     location_id: int = Form(...),
     status: CameraStatus = Form(CameraStatus.ACTIVE),
     video_url: str = Form(None),
@@ -87,7 +86,6 @@ def create_camera(
 
     camera = Camera(
         camera_name=camera_name,
-        street_id=street_id,
         location_id=location_id,
         status=status,
         video_url=video_url,

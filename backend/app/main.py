@@ -5,12 +5,10 @@ from app.models.base import Base
 import app.models
 from app.api.v1.routers.city import router as city_router
 from app.api.v1.routers.camera import router as camera_router
-from app.api.v1.routers.crowd_telemetry import router as telemetry_router
-from app.api.v1.routers.detected_object import router as detected_object_router
-from app.api.v1.routers.anomalies import router as anomalies_router
 from app.api.v1.routers.street import router as street
 from app.api.v1.routers.location import router as location
 from app.api.v1.routers.stream import router as stream_router   # <-- YOLO WebSocket
+from app.api.v1.routers.trafficLogs import router as trafficLogs
 
 app = FastAPI(title="ASSBI Platform")
 
@@ -24,11 +22,9 @@ app.add_middleware(
 
 app.include_router(city_router)
 app.include_router(camera_router)
-app.include_router(telemetry_router)
-app.include_router(detected_object_router)
-app.include_router(anomalies_router)
 app.include_router(street)
 app.include_router(location)
+app.include_router(trafficLogs)
 app.include_router(stream_router)   # <-- WebSocket стрим
 
 

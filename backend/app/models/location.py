@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -10,15 +10,39 @@ class Location(Base):
 
     location_id = Column(Integer, primary_key=True, index=True)
 
-    name = Column(String(150), nullable=False, unique=True, index=True)
+    street_id = Column(
+        Integer,
+        ForeignKey("streets.street_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    name = Column(
+        String(150),
+        nullable=False,
+        unique=True,
+        index=True
+    )
 
     description = Column(String(500), nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now()
     )
 
-    cameras = relationship("Camera", back_populates="location")
+    street = relationship(
+        "Street",
+        back_populates="locations"
+    )
+
+    cameras = relationship(
+        "Camera",
+        back_populates="location"
+    )

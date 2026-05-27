@@ -1,42 +1,55 @@
-"""
-YOLO Human Detector
-Загружает модель best.pt и детектирует людей из видео/потока.
-"""
-
 import cv2
 import numpy as np
 import base64
 import time
 import os
+import torch
+import sqlite3
+import queue
+import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Generator, Tuple, List, Dict, Any
+from collections import defaultdict
+from ultralytics import YOLO
 
-# Путь к весам модели
-WEIGHTS_PATH = Path(__file__).parent.parent.parent / "models" / "weight" / "yolo11n.pt"
+# =========================================================
+# CONFIG
+# =========================================================
 
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Отключаем CUDA, если инференс идет на CPU
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_PATH = BASE_DIR / "traffic.db"
+WEIGHTS_PATH = BASE_DIR / "models" / "weight" / "best2.pt"
+
+# Идеальная высота для вашей камеры (чуть выше пешеходного перехода)
+LINE_Y = 220  
+
+FRAME_SKIP = 3   # Экономия CPU (обрабатываем каждый 3-й кадр)
+FPS_LIMIT = 10   # Ограничение FPS для устранения лагов
+
+# =========================================================
+# THREAD-SAFE GLOBAL STATE
+# =========================================================
+
+_model = None
+track_history = defaultdict(list)
+counted_ids = set()
+car_counter = 0
+last_saved_count = 0
+
+frame_queue = queue.Queue(maxsize=2)  # Защита от переполнения памяти
+worker_running = False
+state_lock = threading.Lock()
+
+# =========================================================
+# UTILITIES
+# =========================================================
 
 def load_model():
-    """Загружает YOLO модель. best.pt если есть, иначе yolov8n.pt (скачается автоматически)."""
-    try:
-        from ultralytics import YOLO
-
-        if WEIGHTS_PATH.exists():
-            print(f"[YOLO] Загружаем модель: {WEIGHTS_PATH}")
-            model = YOLO(str(WEIGHTS_PATH))
-        else:
-            print("[YOLO] best.pt не найден — загружаем стандартную yolov8n.pt")
-            model = YOLO("yolov8n.pt")
-
-        print("[YOLO] Модель загружена успешно")
-        return model
-
-    except ImportError:
-        raise RuntimeError("ultralytics не установлен. Запустите: pip install ultralytics")
-
-
-# Глобальный экземпляр модели (singleton)
-_model = None
-
+    print(f"[YOLO] Загрузка модели: {WEIGHTS_PATH}")
+    return YOLO(str(WEIGHTS_PATH))
 
 def get_model():
     global _model
@@ -44,190 +57,230 @@ def get_model():
         _model = load_model()
     return _model
 
+def open_video_source(source):
+    if isinstance(source, str) and ("youtube.com" in source or "youtu.be" in source):
+        import yt_dlp
+        print("[YT-DLP] Запрос экономичного потока с YouTube (720p)...")
+        ydl_opts = {"quiet": True, "format": "best[height<=720]/worst"}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(source, download=False)
+            source = info["url"]
 
-def detect_humans(frame: np.ndarray, conf_threshold: float = 0.4) -> Tuple[np.ndarray, List[Dict]]:
-    """
-    Детектирует людей на кадре.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;3000000" 
+    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
 
-    Возвращает:
-        annotated_frame - кадр с нарисованными боксами
-        detections - список словарей с данными о каждом объекте
-    """
+def save_traffic_log(camera_id: int, cars_count: int):
+    """Прямая безопасная запись логов в вашу базу данных PostgreSQL."""
+    import psycopg2
+    try:
+        # 1. Получаем текущее время в формате, который ожидает колонка 'timestamp without time zone'
+        current_datetime = datetime.now()
+        current_datetime_str = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"[POSTGRES TRY] Попытка записи. Время: {current_datetime_str}, Машин: {cars_count}")
+
+        # 2. Подключаемся напрямую к вашей БД PostgreSQL
+        # Используем те же параметры, что указаны в DATABASE_URL
+        conn = psycopg2.connect(
+            dbname="smart_city_db",
+            user="postgres",
+            password="root",
+            host="localhost",
+            port="5432"
+        )
+        cur = conn.cursor()
+
+        # 3. Записываем данные. Имена таблиц в PostgreSQL чувствительны к регистру, 
+        # поэтому пишем 'traffic_logs' строго строчными буквами, как в вашей схеме.
+        cur.execute("""
+            INSERT INTO traffic_logs (camera_id, timestamp, cars_count)
+            VALUES (%s, %s, %s)
+        """, (camera_id, current_datetime, cars_count))
+
+        # 4. Фиксируем транзакцию
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[POSTGRES SUCCESS] Лог успешно сохранен в PostgreSQL! Камера: {camera_id}")
+
+    except Exception as e:
+        print("[POSTGRES ERROR] Ошибка записи в базу данных PostgreSQL:", e)
+
+    except Exception as e:
+        print("[DB ERROR] Ошибка записи типа данных TIMESTAMP:", e)
+
+def frame_to_base64(frame, quality=70):
+    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return base64.b64encode(buffer).decode("utf-8")
+
+def crossed(prev_y, curr_y, line_y):
+    # Двунаправленный подсчет (сверху-вниз и снизу-вверх)
+    return (prev_y < line_y and curr_y >= line_y) or (prev_y > line_y and curr_y <= line_y)
+
+# =========================================================
+# CORE COMPUTER VISION ENGINE
+# =========================================================
+
+def detect_objects(frame, camera_id=1, conf_threshold=0.15):
+    global car_counter
+
     model = get_model()
+    results = model.track(
+        source=frame, persist=True, conf=conf_threshold,
+        imgsz=480, device=DEVICE, verbose=False, tracker="bytetrack.yaml"
+    )[0]
 
-    results = model(frame, conf=conf_threshold, verbose=False)[0]
-
+    annotated = frame.copy()
     detections = []
-    annotated_frame = frame.copy()
+    
+    height, width, _ = frame.shape
+    cv2.line(annotated, (0, LINE_Y), (width, LINE_Y), (255, 255, 0), 3)
+
+    if results.boxes is None or len(results.boxes) == 0:
+        cv2.putText(annotated, f"Total Vehicles Crossed: {car_counter}", (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        return annotated, detections, 0
 
     for box in results.boxes:
+        if box.id is None:
+            continue
+
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         class_name = model.names[cls_id]
 
-        if class_name != "person":
-            continue
-
         x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        track_id = int(box.id[0])
 
-        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 100), 2)
-        label = f"Person {conf:.0%}"
-        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(annotated_frame, (x1, y1 - lh - 8), (x1 + lw, y1), (0, 255, 100), -1)
-        cv2.putText(annotated_frame, label, (x1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+        with state_lock:
+            track_history[track_id].append((cx, cy))
+            if len(track_history[track_id]) > 2:
+                track_history[track_id].pop(0)
+
+            if len(track_history[track_id]) == 2:
+                prev = track_history[track_id][0]
+                curr = track_history[track_id][1]
+
+                if track_id not in counted_ids:
+                    if crossed(prev[1], curr[1], LINE_Y):
+                        car_counter += 1
+                        counted_ids.add(track_id)
+                        
+                        # ТРИГГЕР СОБЫТИЯ: Записываем в PostgreSQL строго в момент пересечения!
+                        save_traffic_log(camera_id, 1) 
+
+        # Отрисовка UI
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 255), 2)
+        cv2.circle(annotated, (cx, cy), 4, (0, 0, 255), -1)
+        cv2.putText(annotated, f"ID: {track_id}", (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
         detections.append({
-            "object_type": "person",
-            "confidence_score": round(conf, 3),
-            "bbox": [x1, y1, x2, y2],
+            "id": track_id, "class": class_name, "confidence": round(conf, 3),
+            "bbox": [x1, y1, x2, y2], "category": "vehicle"
         })
 
-    count = len(detections)
-    label_count = f"People: {count}"
-    cv2.rectangle(annotated_frame, (8, 8), (160, 38), (0, 0, 0), -1)
-    cv2.putText(annotated_frame, label_count, (12, 29),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2)
+    cv2.putText(annotated, f"Total Vehicles Crossed: {car_counter}", (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    return annotated_frame, detections
-
-
-def frame_to_base64(frame: np.ndarray, quality: int = 75) -> str:
-    """Конвертирует кадр OpenCV в base64 JPEG строку для передачи по WebSocket."""
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-    _, buffer = cv2.imencode(".jpg", frame, encode_param)
-    return base64.b64encode(buffer).decode("utf-8")
+    return annotated, detections, len(results.boxes)
 
 
 # =========================================================
-# ✅ НОВАЯ ФУНКЦИЯ — резолвинг источника видео
+# ИСПРАВЛЕННЫЙ ВОРКЕР (Очищен от багов со счетчиком)
 # =========================================================
 
-def resolve_video_source(source: str) -> str:
-    """
-    Преобразует источник видео в прямой URL для OpenCV.
-
-    - YouTube / youtu.be  → прямой CDN URL через yt-dlp
-    - RTSP / HTTP / файл  → без изменений
-    """
-    if not isinstance(source, str):
-        return source  # int (webcam index) — возвращаем как есть
-
-    is_youtube = (
-        "youtube.com/watch" in source
-        or "youtu.be/" in source
-        or "youtube.com/shorts" in source
-    )
-
-    if is_youtube:
+def _video_processing_worker(source, camera_id, conf_threshold):
+    global worker_running
+    print("[THREAD-WORKER] Фоновый движок успешно запущен.")
+    
+    while worker_running:
+        cap = None
         try:
-            import yt_dlp  # pip install yt-dlp
-        except ImportError:
-            raise RuntimeError(
-                "yt-dlp не установлен. Запустите: pip install yt-dlp"
-            )
-
-        ydl_opts = {
-            # Предпочитаем mp4 с прямым URL без склейки дашей
-            "format": "best[ext=mp4]/best[protocol=https]/best",
-            "quiet": True,
-            "no_warnings": True,
-        }
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source, download=False)
-                direct_url = info.get("url")
-                if not direct_url:
-                    # Иногда url лежит внутри formats
-                    formats = info.get("formats", [])
-                    if formats:
-                        direct_url = formats[-1]["url"]
-                if not direct_url:
-                    raise RuntimeError("yt-dlp не вернул URL")
-                print(f"[yt-dlp] Резолвнули YouTube → {direct_url[:80]}...")
-                return direct_url
-        except Exception as e:
-            raise RuntimeError(f"Не удалось получить URL с YouTube: {e}")
-
-    return source
-
-
-# =========================================================
-# ✅ ИСПРАВЛЕННАЯ open_video_source
-# =========================================================
-
-def open_video_source(source: str | int) -> cv2.VideoCapture:
-    """
-    Открывает видео из файла, URL-потока, YouTube или веб-камеры.
-    YouTube-ссылки автоматически резолвятся через yt-dlp.
-    """
-    real_source = resolve_video_source(source)
-
-    # Для сетевых потоков используем CAP_FFMPEG явно
-    if isinstance(real_source, str) and (
-        real_source.startswith("rtsp://")
-        or real_source.startswith("http://")
-        or real_source.startswith("https://")
-    ):
-        cap = cv2.VideoCapture(real_source, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    else:
-        cap = cv2.VideoCapture(real_source)
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Не удалось открыть источник видео: {source}")
-
-    return cap
-
-
-def stream_frames(
-    source: str | int,
-    conf_threshold: float = 0.4,
-    max_fps: int = 15,
-) -> Generator[Dict[str, Any], None, None]:
-    """
-    Генератор кадров с детекцией.
-    Используется в WebSocket endpoint.
-
-    Yields словари:
-        {
-            "frame_b64": str,
-            "person_count": int,
-            "detections": List[Dict],
-            "fps": float,
-        }
-    """
-    cap = open_video_source(source)  # ✅ теперь резолвит YouTube автоматически
-    frame_interval = 1.0 / max_fps
-    prev_time = 0.0
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                # Видеофайл закончился — перемотка
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cap = open_video_source(source)
+            frame_id = 0
+            
+            while worker_running:
                 ret, frame = cap.read()
                 if not ret:
+                    print("[THREAD-WORKER] Сбой чтения фрейма. Переподключение...")
                     break
 
-            now = time.time()
-            elapsed = now - prev_time
-            if elapsed < frame_interval:
-                time.sleep(frame_interval - elapsed)
+                frame_id += 1
+                if frame_id % FRAME_SKIP != 0:
+                    continue
+
+                # Передаем camera_id внутрь детектора
+                annotated, detections, vehicle_count = detect_objects(frame, camera_id, conf_threshold)
+
+                packet = {
+                    "frame_b64": frame_to_base64(annotated),
+                    "car_count": car_counter,
+                    "detections": detections,
+                    "current_frame_vehicles": vehicle_count,
+                    "fps": FPS_LIMIT
+                }
+
+                if frame_queue.full():
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                        
+                frame_queue.put(packet)
+                time.sleep(1 / FPS_LIMIT)
+                
+        except Exception as e:
+            print(f"[THREAD-WORKER ERROR]: {e}")
+            time.sleep(3)
+        finally:
+            if cap:
+                cap.release()
+                
+    print("[THREAD-WORKER] Фоновый движок полностью остановлен.")
+
+
+# =========================================================
+# БЕЗОПАСНЫЙ СИНГЛТОН-ИНТЕРФЕЙС СТРИМА (stream_frames)
+# =========================================================
+
+def stream_frames(source, camera_id=1, conf_threshold=None):
+    global worker_running
+    if conf_threshold is None:
+        conf_threshold = CONF_THRESHOLD
+
+    # ПРОВЕРКА: Если поток уже запущен, НЕ создаем дубликат!
+    # Просто очищаем старую очередь и подлючаемся к существующему конвейеру данных.
+    if not worker_running:
+        while not frame_queue.empty():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        worker_running = True
+        worker_thread = threading.Thread(
+            target=_video_processing_worker,
+            args=(source, camera_id, conf_threshold),
+            daemon=True
+        )
+        worker_thread.start()
+    else:
+        print("[STREAM] Подключение к уже запущенному фоновому потоку обработки.")
+
+    try:
+        while worker_running:
+            try:
+                packet = frame_queue.get(timeout=0.2)
+                yield packet
+            except queue.Empty:
                 continue
-            prev_time = time.time()
-
-            annotated, detections = detect_humans(frame, conf_threshold)
-
-            fps = 1.0 / max(elapsed, 1e-6)
-
-            yield {
-                "frame_b64": frame_to_base64(annotated),
-                "person_count": len(detections),
-                "detections": detections,
-                "fps": round(fps, 1),
-            }
     finally:
-        cap.release()
+        # ВНИМАНИЕ: Убираем здесь worker_running = False!
+        # Поток должен продолжать жить в фоне, даже если один из пользователей закрыл вкладку браузера.
+        # Таким образом, детекция и запись в БД не прервутся ни на секунду.
+        pass

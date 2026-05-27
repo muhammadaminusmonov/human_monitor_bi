@@ -25,11 +25,8 @@ class Street(Base):
         server_default=func.now(),
         onupdate=func.now()
     )
-
-    city = relationship("City", back_populates="streets")
-
-    cameras = relationship(
-        "Camera",
-        back_populates="street",
-        cascade="all, delete-orphan"
+    locations = relationship(
+    "Location",
+    back_populates="street"
     )
+    city = relationship("City", back_populates="streets")

@@ -19,14 +19,6 @@ class Camera(Base):
     __tablename__ = "cameras"
 
     camera_id = Column(Integer, primary_key=True, index=True)
-
-    street_id = Column(
-        Integer,
-        ForeignKey("streets.street_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True
-    )
-
     location_id = Column(
         Integer,
         ForeignKey("locations.location_id", ondelete="CASCADE"),
@@ -35,7 +27,6 @@ class Camera(Base):
     )
 
     camera_name = Column(String(150), nullable=False, unique=True)
-
     ip_address = Column(String(100), nullable=True)
 
     latitude = Column(Float, nullable=True)
@@ -51,10 +42,9 @@ class Camera(Base):
         nullable=False
     )
 
-    # STREAM URL
+
     video_url = Column(String(500), nullable=True)
 
-    # UPLOADED MP4
     video_file = Column(String(500), nullable=True)
 
     ai_model_version = Column(String(100), nullable=True)
@@ -68,25 +58,5 @@ class Camera(Base):
         server_default=func.now(),
         onupdate=func.now()
     )
-
-    street = relationship("Street", back_populates="cameras")
-
     location = relationship("Location", back_populates="cameras")
-
-    telemetries = relationship(
-        "CrowdTelemetry",
-        back_populates="camera",
-        cascade="all, delete-orphan"
-    )
-
-    detected_objects = relationship(
-        "DetectedObject",
-        back_populates="camera",
-        cascade="all, delete-orphan"
-    )
-
-    alerts = relationship(
-        "AnomaliesAndAlert",
-        back_populates="camera",
-        cascade="all, delete-orphan"
-    )
+    traffic_logs = relationship("TrafficLog", back_populates="camera")
