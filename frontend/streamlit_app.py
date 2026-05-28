@@ -703,7 +703,7 @@ with st.sidebar:
 
     menu = st.radio(
         "nav",
-        ["Dashboard", "Locations", "Points", "Cameras", "Live Feed"],
+        ["Dashboard", "Locations", "Points", "Cameras", "Live Feed", "Traffic Logs", "Chatbot Logs"],
         label_visibility="collapsed"
     )
 
@@ -734,11 +734,13 @@ with st.sidebar:
 ts = datetime.datetime.now().strftime("%b %d, %Y  %H:%M")
 
 PAGE_META = {
-    "Dashboard": ("Dashboard",  "Real-time surveillance overview"),
-    "Locations": ("Locations",  "Manage cities and street registry"),
-    "Points":    ("Points",     "Configure monitoring points"),
-    "Cameras":   ("Cameras",    "Deploy and manage camera fleet"),
-    "Live Feed": ("Live Feed",  "YOLO-annotated vehicle detection stream"),
+    "Dashboard":    ("Dashboard",     "Real-time surveillance overview"),
+    "Locations":    ("Locations",     "Manage cities and street registry"),
+    "Points":       ("Points",        "Configure monitoring points"),
+    "Cameras":      ("Cameras",       "Deploy and manage camera fleet"),
+    "Live Feed":    ("Live Feed",     "YOLO-annotated vehicle detection stream"),
+    "Traffic Logs": ("Traffic Logs",  "Vehicle detection logs and analytics"),
+    "Chatbot Logs": ("Chatbot Logs",  "AI assistant query history and analytics"),
 }
 
 title, desc = PAGE_META.get(menu, ("ASSBI", ""))
@@ -1308,5 +1310,278 @@ elif menu == "Live Feed":
         <div class="vid-ph">
             <div class="vid-icon">▶</div>
             Select a camera and press Show Stream
+        </div>
+        """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────
+# TRAFFIC LOGS
+# ─────────────────────────────────────────────────────────
+
+elif menu == "Traffic Logs":
+
+    cameras = fetch("cameras")
+    cam_id_map = {f"CAM·{c['camera_id']}  {c.get('camera_name', '')}": c["camera_id"] for c in cameras} if cameras else {}
+
+    # ── KPI summary ──
+    stats_raw = fetch("traffic-logs/stats/total-cars")
+    stats_data = stats_raw.get("data", []) if isinstance(stats_raw, dict) else []
+    total_cars_all = sum(r.get("total_cars") or 0 for r in stats_data)
+
+    logs_all = fetch("traffic-logs")
+    logs_list = logs_all if isinstance(logs_all, list) else []
+
+    st.markdown(f"""
+    <div class="kpi-grid">
+        <div class="kpi">
+            <div class="kpi-top">
+                <div class="kpi-icon">🚗</div>
+                <span class="kpi-badge kpi-badge-green">All time</span>
+            </div>
+            <div class="kpi-num">{total_cars_all:,}</div>
+            <div class="kpi-label">Total cars detected</div>
+            <div class="kpi-glow" style="background:#6ee7b7;"></div>
+        </div>
+        <div class="kpi">
+            <div class="kpi-top">
+                <div class="kpi-icon">📋</div>
+                <span class="kpi-badge kpi-badge-blue">Records</span>
+            </div>
+            <div class="kpi-num">{len(logs_list)}</div>
+            <div class="kpi-label">Log entries (last 100)</div>
+            <div class="kpi-glow" style="background:#93c5fd;"></div>
+        </div>
+        <div class="kpi">
+            <div class="kpi-top">
+                <div class="kpi-icon">◎</div>
+                <span class="kpi-badge kpi-badge-amber">Cameras</span>
+            </div>
+            <div class="kpi-num">{len(stats_data)}</div>
+            <div class="kpi-label">Cameras with detections</div>
+            <div class="kpi-glow" style="background:#fbbf24;"></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Cars per camera chart ──
+    if stats_data:
+        st.markdown('<div class="sec"><div class="sec-title">Cars per camera</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+        cam_name_map = {c["camera_id"]: c.get("camera_name", f"CAM·{c['camera_id']}") for c in cameras} if cameras else {}
+        labels = [cam_name_map.get(r["camera_id"], f"CAM·{r['camera_id']}") for r in stats_data]
+        values = [r.get("total_cars") or 0 for r in stats_data]
+        fig_cars = go.Figure(go.Bar(
+            x=labels,
+            y=values,
+            marker_color="#6ee7b7",
+            marker_line_color="#0c0c0e",
+            marker_line_width=1,
+        ))
+        fig_cars.update_layout(title="Total cars detected per camera", **PLOT)
+        st.plotly_chart(fig_cars, use_container_width=True)
+
+    # ── Filter & browse logs ──
+    st.markdown('<div class="sec"><div class="sec-title">Browse logs</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+
+    f1, f2, f3 = st.columns([2, 2, 2])
+    with f1:
+        sel_cam_filter = st.selectbox("Filter by camera", ["All cameras"] + list(cam_id_map.keys()), key="tl_cam_filter")
+    with f2:
+        from_dt = st.date_input("From date", value=None, key="tl_from")
+    with f3:
+        to_dt = st.date_input("To date", value=None, key="tl_to")
+
+    # Build filtered fetch params
+    params = {}
+    if sel_cam_filter != "All cameras":
+        params["camera_id"] = cam_id_map[sel_cam_filter]
+    if from_dt:
+        params["from_time"] = datetime.datetime.combine(from_dt, datetime.time.min).isoformat()
+    if to_dt:
+        params["to_time"] = datetime.datetime.combine(to_dt, datetime.time.max).isoformat()
+
+    try:
+        url = f"{API_URL}/traffic-logs/"
+        r = requests.get(url, params=params, timeout=5)
+        filtered_logs = r.json() if r.status_code == 200 else []
+    except Exception:
+        filtered_logs = []
+
+    if not filtered_logs:
+        st.info("No traffic logs match the current filter.")
+    else:
+        df_logs = pd.DataFrame(filtered_logs)
+        st.dataframe(df_logs, use_container_width=True, hide_index=True)
+
+        # ── Cars over time chart (if timestamp present) ──
+        if "timestamp" in df_logs.columns and "cars_count" in df_logs.columns:
+            st.markdown('<div class="sec"><div class="sec-title">Detection timeline</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+            df_t = df_logs.copy()
+            df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce")
+            df_t = df_t.dropna(subset=["timestamp"]).sort_values("timestamp")
+            fig_t = go.Figure(go.Scatter(
+                x=df_t["timestamp"],
+                y=df_t["cars_count"],
+                mode="lines+markers",
+                line=dict(color="#6ee7b7", width=1.5),
+                marker=dict(color="#6ee7b7", size=4),
+                fill="tozeroy",
+                fillcolor="rgba(110,231,183,0.05)",
+            ))
+            fig_t.update_layout(title="Cars detected over time", **PLOT)
+            st.plotly_chart(fig_t, use_container_width=True)
+
+    # ── Create log entry ──
+    st.markdown('<div class="sec"><div class="sec-title">Create log entry</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+
+    if not cam_id_map:
+        st.warning("No cameras found — deploy a camera first.")
+    else:
+        with st.form("tl_create_form", clear_on_submit=True):
+            tl_cam     = st.selectbox("Camera", list(cam_id_map.keys()), key="tl_create_cam")
+            tl_cars    = st.number_input("Cars count", min_value=0, step=1, key="tl_cars")
+            tl_ts      = st.text_input("Timestamp (ISO, leave blank for now)", placeholder="2024-01-15T14:30:00", key="tl_ts")
+            tl_submit  = st.form_submit_button("Create Log", type="primary")
+            if tl_submit:
+                payload = {
+                    "camera_id":  cam_id_map[tl_cam],
+                    "cars_count": int(tl_cars),
+                }
+                if tl_ts.strip():
+                    payload["timestamp"] = tl_ts.strip()
+                try:
+                    res = requests.post(f"{API_URL}/traffic-logs/", json=payload, timeout=10)
+                    if res.status_code in [200, 201]:
+                        st.success("Log entry created.")
+                        st.rerun()
+                    else:
+                        st.error(f"[{res.status_code}] {res.text}")
+                except Exception as e:
+                    st.error(str(e))
+
+    # ── Delete log entry ──
+    if filtered_logs:
+        st.markdown('<div class="sec"><div class="sec-title">Delete log entry</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+        del_map = {f"ID:{l['logs_id']}  cam·{l.get('camera_id','?')}  {l.get('timestamp','')[:16]}": l["logs_id"] for l in filtered_logs}
+        sel_del = st.selectbox("Select entry to delete", list(del_map.keys()), key="tl_del_sel")
+        if st.button("Delete Entry", key="tl_del_btn"):
+            try:
+                r = requests.delete(f"{API_URL}/traffic-logs/{del_map[sel_del]}/", timeout=5)
+                if r.status_code in [200, 204]:
+                    st.success("Log entry deleted.")
+                    st.rerun()
+                else:
+                    st.error(f"[{r.status_code}] {r.text}")
+            except Exception as e:
+                st.error(str(e))
+
+# ─────────────────────────────────────────────────────────
+# CHATBOT  — AI data analyst (no API key needed)
+# Fetches live backend data and sends it as context to the
+# Claude API so the AI can answer questions about YOUR data.
+# ─────────────────────────────────────────────────────────
+
+elif menu == "Chatbot Logs":
+
+    import json as _json
+
+    # ── session state ──
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    col_title, col_btn = st.columns([8, 1])
+    with col_btn:
+        if st.button("🗑 Clear", key="cb_clear"):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    st.markdown('<div class="sec"><div class="sec-title">Ask about your data</div><div class="sec-line"></div></div>', unsafe_allow_html=True)
+
+    # ── render history ──
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # ── input ──
+    user_input = st.chat_input("e.g. Which camera detected the most cars? Any inactive cameras?")
+
+    if user_input:
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Fetching your data…"):
+
+                # ── pull all live data from your backend ──
+                try:
+                    cameras_data   = fetch("cameras")   or []
+                    locations_data = fetch("locations") or []
+                    streets_data   = fetch("streets")   or []
+                    cities_data    = fetch("cities")    or []
+                    logs_data      = fetch("traffic-logs") or []
+                    stats_raw      = fetch("traffic-logs/stats/total-cars")
+                    stats_data     = stats_raw.get("data", []) if isinstance(stats_raw, dict) else []
+                except Exception:
+                    cameras_data = locations_data = streets_data = cities_data = logs_data = stats_data = []
+
+                # ── build a compact data snapshot to inject as system context ──
+                data_context = f"""
+You are ASSBI Data Analyst. You ONLY analyze the surveillance data provided below.
+Do not invent numbers. If data is empty, say so clearly.
+Answer in a clear, concise way. Use bullet points or tables when helpful.
+
+=== LIVE DATA SNAPSHOT ===
+
+CAMERAS ({len(cameras_data)} total):
+{_json.dumps(cameras_data, default=str, indent=2)[:3000]}
+
+LOCATIONS ({len(locations_data)} total):
+{_json.dumps(locations_data, default=str, indent=2)[:1000]}
+
+STREETS ({len(streets_data)} total):
+{_json.dumps(streets_data, default=str, indent=2)[:800]}
+
+CITIES ({len(cities_data)} total):
+{_json.dumps(cities_data, default=str, indent=2)[:500]}
+
+TRAFFIC LOGS — last 100 entries ({len(logs_data)} shown):
+{_json.dumps(logs_data, default=str, indent=2)[:4000]}
+
+CARS TOTAL PER CAMERA:
+{_json.dumps(stats_data, default=str, indent=2)[:1000]}
+""".strip()
+
+                # ── send to Anthropic ──
+                try:
+                    api_resp = requests.post(
+                        f"{API_URL}/ai/chat",
+                        json={
+                            "message": user_input,
+                            "context": {
+                                "cameras": cameras_data,
+                                "logs": logs_data,
+                                "locations": locations_data,
+                            }
+                        },
+                        timeout=60,
+                    )
+
+                    if api_resp.status_code == 200:
+                        reply = api_resp.json()["reply"]
+                        st.markdown(reply)
+                        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+                    else:
+                        err = api_resp.json()
+                        st.error(f"API error [{api_resp.status_code}]: {err.get('error', {}).get('message', api_resp.text)}")
+
+                except requests.exceptions.Timeout:
+                    st.error("Request timed out.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    if not st.session_state.chat_history:
+        st.markdown("""
+        <div class="vid-ph" style="padding:40px;">
+            <div class="vid-icon">💬</div>
+            Ask anything — the AI reads your live cameras, locations, and traffic logs to answer.
         </div>
         """, unsafe_allow_html=True)

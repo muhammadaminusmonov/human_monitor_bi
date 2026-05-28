@@ -5,6 +5,7 @@ from sqlalchemy.sql import func
 from app.models.base import Base
 
 
+
 class ChatbotLog(Base):
     __tablename__ = "chatbot_logs"
 
