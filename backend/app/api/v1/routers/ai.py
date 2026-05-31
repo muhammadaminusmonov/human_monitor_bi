@@ -1,30 +1,38 @@
+from openai import OpenAI
+from dotenv import load_dotenv
 from fastapi import APIRouter
 from pydantic import BaseModel
-from google import genai
-from dotenv import load_dotenv
+import json
 import os
 
 load_dotenv()
 
 router = APIRouter()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-print("KEY:", GEMINI_API_KEY)
-
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class ChatRequest(BaseModel):
     message: str
+    context: dict = {}
 
 @router.post("/chat")
-async def ai_chat(data: ChatRequest):
+async def ai_chat(request: ChatRequest):
+    system_prompt = f"""You are ASSBI Data Analyst. You ONLY analyze the surveillance data provided below.
+Do not invent numbers. If data is empty, say so clearly.
+Answer in a clear, concise way. Use bullet points or tables when helpful.
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=data.message
+=== LIVE DATA SNAPSHOT ===
+CAMERAS: {json.dumps(request.context.get('cameras', []), default=str)[:3000]}
+LOGS: {json.dumps(request.context.get('logs', []), default=str)[:3000]}
+LOCATIONS: {json.dumps(request.context.get('locations', []), default=str)[:1000]}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=1000,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.message}
+        ]
     )
 
-    return {
-        "response": response.text
-    }
+    return {"reply": response.choices[0].message.content}
